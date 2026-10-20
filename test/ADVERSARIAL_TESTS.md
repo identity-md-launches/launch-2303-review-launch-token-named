@@ -11,9 +11,16 @@ dependencies and run offline.
 | `PulseTreasuryInvariant.t.sol` | Three keepers donate ETH/IDM, pulse, burn, forge callbacks and advance time, interleaved with real v4 trades, full liquidity removal/restoration and fee collection. Ghost totals reconcile treasury ETH with deposits minus actual spending, and IDM with deposits plus purchases minus burns. Caller balances cannot profit from pulse/burn. |
 | Treasury/launch invariants | Total IDM across every participating holder remains `1e27`; the hook receives no trading revenue; only successful swaps advance `swapCount`; pool binding remains fixed; reserved bits/release count remain zero; reachable tempo, heat, pressure, root and size-EMA stay in SPEC bounds. |
 | `IdmLaunchSafety.t.sol` | Token-only liquidity starts with zero ETH at the real PoolManager; first buy, sell, factory fee collection and full exit settle. Both initialization callbacks reject malformed keys without poisoning a subsequent valid initialization. Unauthorized/pre-initialization swaps, incorrect permission-address bits, and initialization at an address with no hook code fail. Actual deltas determine mutation independently of requested amounts/direction/hook data. A real swap writes only storage slots 0 and 1. Runtime checks reject common administrative selectors and escape opcodes. |
+| `PulseTreasuryAnchor.t.sol` | Covers the revised `priceAnchor()` (finding `a3a45cc2`). At launch the price sits on the seed's inactive top tick, so the anchor comes from the bitmap and equals slot0. A free sell parks at any fuzzed height and the anchor stays at the seed top. Draining an upper position leaves the price in a gap about 8 bitmap words wide, and the anchor walks down to the lower position's top. With liquidity only above the price, or with the price below every position, there is nothing to reach: `nextPulse` is not ready, `pulse()` reverts `NoFill`, and state and price are untouched. A buy that stops exactly on the top tick re-enters the range, and the next pulse is ordinary. A real buy recovers from a dust park. |
+| `PulseTreasuryAnchorInvariantTest` | Random parks to any height, buys (including ones that stop exactly on the top tick), seed removal/restore and time. `priceAnchor()` matches an oracle built from the one known position rather than the tick bitmap. With silence and budget, `nextPulse().ready` equals reachability. Every pulse ends within 1% (sqrt) under its anchor. Treasury ETH/IDM reconcile with the pulses, and every swap is filed. |
 | Treasury transaction tests | Nested calls in one transaction check transient-guard cleanup after success, `NotIdle` on the next pulse, and rollback/recovery after `NoFill`. Pulse sizing is bounded and monotone across arbitrary `uint256` inputs. |
 
-Each invariant campaign specifies 256 runs of depth 96 and `fail-on-revert = true` in Solidity.
+Reported, not asserted (`.imd-findings.json`, low): liquidity-1 positions between the seed and a parked
+price become the anchor. Each turns one pulse into a 2-wei / ~60-wei-IDM buy that succeeds and resets the
+silence window. It does not revert `NoFill` as ADAPTATION.md's residual says. The delivered suite only
+checks the recovery path (a real buy restores ordinary pulses).
+
+The two original invariant campaigns run 256 runs of depth 96 (the anchor campaign uses depth 64) and `fail-on-revert = true` in Solidity.
 Only the listed handler selectors are targeted. Expected failures assert their exact custom errors;
 an unexpected revert fails the campaign. Stateless fuzz additions run 1,000 cases each. A deterministic
 handler lifecycle exercises pulse success, early refusal, no-fill refusal, liquidity restoration,
@@ -44,11 +51,13 @@ For local checks with all generated artifacts kept in scratch, append
 `--out test/scratch/out --cache-path test/scratch/cache` to the Forge commands.
 No runtime RPC, environment mutation, downloaded dependency, or fork is required.
 
-Local verification with the required seed: `forge build` succeeded; `forge test` reported 230 passed,
-0 failed, 0 skipped across 15 suites. Foundry groups each suite's invariant predicates into one
-campaign: the two campaigns executed 24,576 handler calls each, with zero unexpected reverts.
-The independent vector validator passed all 130 v1 and 554 v2 cases. No new production defect was
-reproduced by these checks.
+Local verification with the required seed: `forge build` succeeded; `forge test` reported 245 passed,
+0 failed, 0 skipped across 17 suites, on the tree with the revised `PulseTreasury`. Foundry groups each
+suite's invariant predicates into one campaign. The two original campaigns executed 24,576 handler calls
+each and the anchor campaign 16,384, all with zero unexpected reverts. In the earlier round the
+independent vector validator passed all 130 v1 and 554 v2 cases (python3 is not installed on this
+round's machine, so it was not re-run). The one new defect, the dust-anchor liveness gap, is reported in
+`.imd-findings.json`, not asserted.
 
 ## Launch verification limits
 
