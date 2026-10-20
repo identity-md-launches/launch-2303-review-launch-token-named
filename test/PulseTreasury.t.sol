@@ -16,7 +16,9 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {PoolRouter} from "./helpers/PoolRouter.sol";
 
 /// @dev Tries to drive the treasury from inside someone else's unlock.
@@ -240,14 +242,19 @@ contract PulseTreasuryTest is Test {
 
     /// @dev Audit finding dff8117: with no liquidity reachable before the price limit the swap fills (0, 0).
     ///      The pulse must then revert instead of filing a 0-wei sell (heat -1, pressure -1000, lastTs reset).
+    ///      Review finding a3a45cc2: nextPulse() agrees, reporting not ready while there is nothing to buy.
     function test_PulseWithNoFillRevertsAndLeavesStateUntouched() public {
         _saturate(5);
         router.liquidity(key, -LIQ); // the LP withdraws everything
         _idle();
         (uint256 a, uint256 b) = hook.raw();
         uint256 ethBefore = address(treasury).balance;
-        (bool ready,,,) = treasury.nextPulse();
-        assertTrue(ready); // the window is open; only the pool is empty
+        (bool ready, uint256 amount, uint256 idleSec,) = treasury.nextPulse();
+        assertFalse(ready, "nothing to buy: not ready");
+        assertGe(idleSec, 15 minutes); // the window is open and the budget is there; only the pool is empty
+        assertGt(amount, 0);
+        (, bool found) = treasury.priceAnchor();
+        assertFalse(found);
         vm.expectRevert(PulseTreasury.NoFill.selector);
         treasury.pulse();
         (uint256 a2, uint256 b2) = hook.raw();
@@ -259,9 +266,154 @@ contract PulseTreasuryTest is Test {
         assertEq(address(treasury).balance, ethBefore);
         // The idle window is not burnt: as soon as liquidity is back the same pulse goes through.
         router.liquidity(key, LIQ);
+        (ready,,,) = treasury.nextPulse();
+        assertTrue(ready);
         treasury.pulse();
         assertEq(hook.state().heat, 6);
         assertEq(hook.state().swapCount, 11);
+    }
+
+    /// @dev The swap itself may still deliver nothing (dust liquidity before the limit): the in-swap guard holds.
+    function test_PulseWithDustLiquidityRevertsNoFill() public {
+        _saturate(5);
+        router.liquidity(key, -LIQ);
+        router.liquidity(key, 1); // 1 wei of liquidity: a 1% move yields 0 IDM
+        _idle();
+        (bool ready,,,) = treasury.nextPulse();
+        assertTrue(ready); // a tick is initialized, so the view cannot tell dust from depth
+        (uint256 a, uint256 b) = hook.raw();
+        vm.expectRevert(PulseTreasury.NoFill.selector);
+        treasury.pulse();
+        (uint256 a2, uint256 b2) = hook.raw();
+        assertEq(a2, a);
+        assertEq(b2, b);
+    }
+
+    // ---------------------------------------------------------------- parked price (review finding a3a45cc2)
+
+    /// @dev Launch shape: IDM-only liquidity below the opening tick (the pool opens with no ETH side).
+    function _launchShape() internal {
+        router.liquidity(key, -LIQ);
+        router.liquidityRange(key, -60000, 0, 1e24);
+    }
+
+    function _slot0() internal view returns (uint160 price, int24 tick) {
+        (price, tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+    }
+
+    /// @dev Inside active liquidity the anchor is slot0 itself: the 1% rule is unchanged there.
+    function test_PriceAnchorInsideLiquidityIsSlot0() public view {
+        (uint160 price,) = _slot0();
+        (uint160 anchor, bool found) = treasury.priceAnchor();
+        assertTrue(found);
+        assertEq(anchor, price);
+    }
+
+    /// @dev A free IDM sell (no ETH to pay out) parks slot0 at the seller's limit, MAX_TICK here, while the
+    ///      liquidity is untouched. The pulse must still buy: its limit is measured from the top of that
+    ///      liquidity (tick 0), not from the parked price, and nextPulse() keeps reporting ready.
+    function test_PulseStillBuysAfterAFreeSellParkedThePrice() public {
+        _launchShape();
+        // Sell 1 IDM with an open limit: delta (0, 0), price parked at MAX_TICK.
+        BalanceDelta d = router.swap(key, SwapParams(false, -1e18, TickMath.MAX_SQRT_PRICE - 1));
+        assertEq(d.amount0(), 0);
+        assertEq(d.amount1(), 0);
+        (, int24 parked) = _slot0();
+        assertEq(parked, TickMath.MAX_TICK - 1);
+        assertEq(IPoolManager(address(manager)).getLiquidity(key.toId()), 0);
+        _saturate(5); // after the park: the hook files the (0, 0) swap itself as a sell (SPEC §3.3.1)
+        _idle();
+
+        (uint160 anchor, bool found) = treasury.priceAnchor();
+        assertTrue(found);
+        assertEq(anchor, TickMath.getSqrtPriceAtTick(0), "anchor = top of the IDM liquidity");
+        (bool ready, uint256 want,,) = treasury.nextPulse();
+        assertTrue(ready);
+
+        uint256 ethBefore = address(treasury).balance;
+        uint32 swaps = hook.state().swapCount;
+        (uint256 amountIn, uint256 amountOut) = treasury.pulse();
+        assertEq(amountIn, want, "full spend: deep liquidity under the anchor");
+        assertGt(amountOut, 0);
+        assertEq(token.balanceOf(address(treasury)), amountOut);
+        assertEq(address(treasury).balance, ethBefore - amountIn);
+        // Filed as a buy, like any pulse; the price is re-anchored inside the liquidity.
+        assertEq(hook.state().swapCount, swaps + 1);
+        assertEq(hook.state().heat, 6);
+        (uint160 priceAfter, int24 tickAfter) = _slot0();
+        assertLt(tickAfter, 0);
+        assertGe(priceAfter, uint160(uint256(anchor) * 9900 / 10_000), "never below 1% under the anchor");
+        // The next pulse is an ordinary one again.
+        _idle();
+        treasury.pulse();
+        assertEq(hook.state().swapCount, swaps + 2);
+    }
+
+    /// @dev A sell that drains a thin ETH side parks the price just above the liquidity: same rule, and the 1%
+    ///      bound holds from the anchor (partial fill when the liquidity under it is thin).
+    function test_ParkedPulseStopsAtOnePercentUnderTheAnchor() public {
+        _launchShape();
+        // A buy puts some ETH into the range and moves the price in; a big sell takes it all out and parks.
+        router.swap(key, SwapParams(true, -int256(uint256(0.02 ether)), TickMath.MIN_SQRT_PRICE + 1));
+        (, int24 t1) = _slot0();
+        assertLt(t1, 0);
+        router.swap(key, SwapParams(false, -1e24, TickMath.MAX_SQRT_PRICE - 1));
+        (, int24 parked) = _slot0();
+        assertEq(parked, TickMath.MAX_TICK - 1);
+        // Make the top of the liquidity thin so a max pulse hits the 1% limit.
+        router.liquidityRange(key, -60000, 0, -(1e24 - 5e16));
+        S.State memory s = hook.state();
+        s.sizeLogEma = 918;
+        s.lastTs = uint40(block.timestamp);
+        _store(s);
+        _idle();
+        (uint160 anchor, bool found) = treasury.priceAnchor();
+        assertTrue(found);
+        assertEq(anchor, TickMath.getSqrtPriceAtTick(0));
+        uint256 ethBefore = address(treasury).balance;
+        (uint256 amountIn, uint256 amountOut) = treasury.pulse();
+        (uint160 priceAfter,) = _slot0();
+        assertLt(amountIn, 0.002 ether, "partial fill");
+        assertGt(amountOut, 0);
+        assertEq(priceAfter, uint160(uint256(anchor) * 9900 / 10_000), "stopped at 1% under the anchor");
+        assertEq(address(treasury).balance, ethBefore - amountIn);
+    }
+
+    /// @dev nextPulse() and pulse() agree in every liquidity shape: ready iff the pulse goes through.
+    function test_NextPulseAgreesWithPulse() public {
+        _launchShape();
+        router.swap(key, SwapParams(false, -1e18, TickMath.MAX_SQRT_PRICE - 1)); // park
+        _idle();
+        (bool ready,,,) = treasury.nextPulse();
+        assertTrue(ready);
+        treasury.pulse();
+        router.liquidityRange(key, -60000, 0, -1e24); // everything gone, price inside the (empty) old range
+        _idle();
+        (ready,,,) = treasury.nextPulse();
+        assertFalse(ready);
+        vm.expectRevert(PulseTreasury.NoFill.selector);
+        treasury.pulse();
+        router.liquidityRange(key, -120000, -60000, 1e24); // liquidity far below, 1000 spacings away
+        (ready,,,) = treasury.nextPulse();
+        assertTrue(ready);
+        (uint160 anchor,) = treasury.priceAnchor();
+        assertEq(anchor, TickMath.getSqrtPriceAtTick(-60000));
+        (, uint256 got) = treasury.pulse();
+        assertGt(got, 0);
+    }
+
+    function test_GasPulseParkedAtMaxTick() public {
+        _launchShape();
+        router.swap(key, SwapParams(false, -1e18, TickMath.MAX_SQRT_PRICE - 1));
+        _idle();
+        vm.cool(address(treasury));
+        vm.cool(address(hook));
+        vm.cool(address(manager));
+        uint256 start = gasleft();
+        treasury.pulse();
+        uint256 used = start - gasleft();
+        emit log_named_uint("pulse() gas (cold, price parked at MAX_TICK, liquidity at tick 0)", used);
+        assertLt(used, 1_500_000);
     }
 
     function test_SixteenPulsesInSilenceCompleteTrack() public {

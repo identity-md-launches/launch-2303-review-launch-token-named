@@ -10,15 +10,18 @@ no withdrawal. Rules and numbers (Russian): `SPEC.md` §9 "Казна-пульс
 | --- | --- | --- |
 | `PULSE_IDLE` | 900 s (15 min) | minimum silence since the hook's `lastTs` |
 | `MAX_PULSE` | 0.002 ETH | largest pulse (L = 812) |
-| `MIN_PULSE` | 0.000025 ETH | dust floor = hook EMA floor (L = 710); below it `pulse()` reverts `NoBudget` |
+| `MIN_PULSE` | 0.000025 ETH | dust floor = hook EMA floor (L = 710); below it `pulse()` reverts `NoBudget` (so a balance under 100 × MIN_PULSE = 0.0025 ETH is unspendable until new ETH arrives: there is no withdrawal) |
 | `HAT_OFFSET` | 24 (1.5 octaves) | pulse size = `2^((sizeLogEma - 24)/16)` in `log2Fixed` space |
 | `BUDGET_DIVISOR` | 100 | one pulse spends at most 1% of the ETH balance |
-| `SQRT_PRICE_LIMIT_BPS` | 9900 | price may fall at most 1.99% per pulse (partial fill at the limit) |
+| `SQRT_PRICE_LIMIT_BPS` | 9900 | price may fall at most 1.99% per pulse (partial fill at the limit), measured from `priceAnchor()`: the pool price inside active liquidity, else the nearest initialized tick at or below it (a parked price does not block pulses) |
 
 Cadence in total silence: one pulse per 15 min, 96/day, at most 0.192 ETH/day (each pulse also <= 1% of the
 balance). Heat never resets during pulsed silence (15 min < 3600 s), so on a saturated grid 16 pulses finish a
 track in ~4 h. The synth thins after 10 min idle and comes back with each pulse; it never reaches sparse or drone. Measured `pulse()` gas
-(cold, test suite): ~143k normal grid, ~169k saturated grid.
+(cold, test suite): ~148k normal grid, ~174k saturated grid, ~676k when the price is parked at MAX_TICK with the
+liquidity at tick 0 (the bitmap walk down to it; the pulse re-anchors the price, so only the first one pays it).
+`nextPulse().ready` is false while there is nothing to buy (no initialized tick at or below the price) and `pulse()`
+then reverts `NoFill` before swapping; keepers should read it before sending.
 
 ## 1. Deploy (after launch)
 

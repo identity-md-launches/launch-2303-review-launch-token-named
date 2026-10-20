@@ -7,6 +7,8 @@ import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.s
 import {IERC20Minimal} from "v4-core/src/interfaces/external/IERC20Minimal.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {TickBitmap} from "v4-core/src/libraries/TickBitmap.sol";
+import {BitMath} from "v4-core/src/libraries/BitMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
@@ -47,6 +49,16 @@ interface ISequencerHookView {
 ///      costs the attacker ~2.5% of their own size for a profit bounded by the pulse's price impact: it is
 ///      unprofitable. sqrtPriceLimit bounds the worst case at a ~2% price move (the swap fills partially
 ///      at the limit and the unspent ETH stays here). The timing is public by design.
+///
+///      Price anchor. The 1% limit is measured from the price the pulse buys at, not blindly from slot0.
+///      A v4 swap that runs out of liquidity moves the price through empty ticks to the caller's limit at no
+///      cost: on this pool (ETH currency0, IDM-only liquidity below the opening tick) any IDM sell past the
+///      ETH side parks slot0 above every position, possibly at MAX_TICK. The pool's active liquidity is then
+///      0, and the anchor is the nearest initialized tick at or below the current tick: the top of the
+///      liquidity the pulse will actually reach. The walk down to it is free, and the 1.99% bound then
+///      applies from there, as SPEC §9 intends. Inside active liquidity the anchor is slot0 itself. With no
+///      initialized tick at or below the price there is nothing to buy: nextPulse() is not ready and pulse()
+///      reverts NoFill before swapping, so the hook never files the empty swap.
 ///
 ///      Transparency. The treasury calls PoolManager.swap itself, so Mutated.sender == address(this) for every
 ///      pulse; clients label these swaps as treasury pulses.
@@ -89,7 +101,8 @@ contract PulseTreasury is IUnlockCallback {
     error Reentrant();
     error NotPulsing();
     error NothingToBurn();
-    /// @dev The swap bought nothing (no liquidity reachable before the price limit): nothing is written.
+    /// @dev Nothing to buy: no initialized tick at or below the price (checked before the swap), or the swap
+    ///      itself delivered no IDM before the price limit. Nothing is written in either case.
     error NoFill();
 
     /// @dev Deploy after launch: the hook must already be initialized on this exact pool.
@@ -128,6 +141,7 @@ contract PulseTreasury is IUnlockCallback {
     }
 
     /// @notice What pulse() would do now: keepers and clients read this before sending.
+    /// @dev ready also needs liquidity the pulse can reach (see priceAnchor): pulse() agrees with it.
     function nextPulse() public view returns (bool ready, uint256 amount, uint256 idleSec, uint8 heat) {
         (uint256 a, uint256 b) = hook.raw();
         // SPEC §3.2 packed layout: lastTs = slot0[160..200), sizeLogEma = slot1[152..168), heat = slot1[168..176).
@@ -136,6 +150,33 @@ contract PulseTreasury is IUnlockCallback {
         heat = uint8(b >> 168);
         amount = pulseSize(uint16(b >> 152), address(this).balance);
         ready = idleSec >= PULSE_IDLE && amount > 0;
+        if (ready) (, ready) = priceAnchor();
+    }
+
+    /// @notice The sqrt price the pulse's 1% limit is measured from, and whether the pulse can reach liquidity.
+    /// @dev Inside active liquidity: the pool's own price. With no active liquidity (the price parked outside
+    ///      every position by a sell that ran past the ETH side): the price of the nearest initialized tick at
+    ///      or below the current tick, which is the upper bound of the position the pulse buys from; the swap
+    ///      walks the empty ticks down to it for free. found == false when no such tick exists (nothing to buy).
+    ///      Bounded: at most one bitmap word per 256 * tickSpacing ticks between the current tick and MIN_TICK.
+    function priceAnchor() public view returns (uint160 sqrtPriceX96, bool found) {
+        int24 tick;
+        (sqrtPriceX96, tick,,) = poolManager.getSlot0(poolId);
+        if (poolManager.getLiquidity(poolId) != 0) return (sqrtPriceX96, true);
+        (int16 wordPos, uint8 bitPos) = TickBitmap.position(TickBitmap.compress(tick, tickSpacing));
+        (int16 minWordPos,) = TickBitmap.position(TickBitmap.compress(TickMath.MIN_TICK, tickSpacing));
+        // All the bits at or below bitPos in the current word (TickBitmap.nextInitializedTickWithinOneWord, lte).
+        uint256 mask = type(uint256).max >> (uint256(type(uint8).max) - bitPos);
+        while (true) {
+            uint256 word = poolManager.getTickBitmap(poolId, wordPos) & mask;
+            if (word != 0) {
+                int24 next = (int24(wordPos) * 256 + int24(uint24(BitMath.mostSignificantBit(word)))) * tickSpacing;
+                return (TickMath.getSqrtPriceAtTick(next), true);
+            }
+            if (wordPos <= minWordPos) return (0, false);
+            --wordPos;
+            mask = type(uint256).max;
+        }
     }
 
     /// @notice Buys a hat-sized amount of IDM after >= 15 min of silence. Callable by anyone.
@@ -144,8 +185,9 @@ contract PulseTreasury is IUnlockCallback {
         (, uint256 amount, uint256 idleSec, uint8 heat) = nextPulse();
         if (idleSec < PULSE_IDLE) revert NotIdle(idleSec);
         if (amount == 0) revert NoBudget();
-        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
-        uint160 limit = uint160(uint256(sqrtPriceX96) * SQRT_PRICE_LIMIT_BPS / 10_000);
+        (uint160 anchor, bool found) = priceAnchor();
+        if (!found) revert NoFill();
+        uint160 limit = uint160(uint256(anchor) * SQRT_PRICE_LIMIT_BPS / 10_000);
         if (limit <= TickMath.MIN_SQRT_PRICE) limit = TickMath.MIN_SQRT_PRICE + 1;
         _setPulsing(true);
         (amountIn, amountOut) = abi.decode(poolManager.unlock(abi.encode(amount, limit)), (uint256, uint256));
