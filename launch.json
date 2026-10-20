@@ -1,0 +1,32 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "SequencerHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "$factory",
+      "1250000000000000",
+      "12500000000000000",
+      "62500000000000000"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "afterInitialize",
+      "afterSwap"
+    ]
+  },
+  "token": {
+    "contract": "SequencerToken",
+    "name": "Intelligent Dance Market",
+    "symbol": "IDM",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Robinhood Chain (4663), IDM/ETH, pairWith eth. Describes the accepted Foundry project at the repository root, imported from https://github.com/discodirector/idm-hook at 69cddfddd0e0bf5903e3e19eab38aebc70285e3a with the accepted launch adaptations. Deploy SequencerToken and SequencerHook. The token has no constructor arguments. Hook arguments, in ABI order: PoolManager, launch token, launch factory, hat, glitch, snare. The three thresholds are ETH wei from QuoteCalibration (0.00125, 0.0125, 0.0625 ETH); retained for ABI compatibility, they are unused by the v2 relative classification. Resolve $poolManager, $token and $factory before mining the hook CREATE2 salt with flags 0x3040. All enabled callbacks require the PoolManager. Both initialization callbacks validate the factory sender, sorted pair containing the launch token, this hook, fee 12500 and tick spacing 60; afterInitialize binds the paired currency and pool ID once and seeds the sequencer. This manifest pairs native ETH as currency0 with IDM as currency1. afterSwap uses actual swap deltas and the post-swap tick to update the two packed state words and emit sequencer events; it returns zero delta. The hook has no owner, signer, admin, upgrade path, hook fee, LP-fee override, return-delta permissions or fund handling. Liquidity callbacks are disabled, leaving factory fee collection unaffected. The pool's LP fee is 1.25%; zero-fee describes the hook only. SPEC.md section 3, the packed state layout, ABI and Solidity test vectors are unchanged by this manifest. initialPrice is the required nominal 1:1 sqrtPriceX96; the deployer derives the actual opening price from the separate launch policy's 10 ETH opening market cap and the deployed token address. PulseTreasury is separate and is not deployed by this manifest. Verified Robinhood hook/token addresses, pool ID and launch transaction receipts are not present in the supplied project; its Sepolia deployment records are not evidence for chain 4663. No transaction was broadcast for this manifest. Robinhood deployment and verification evidence remain pending the launch service's deployment step; no deployed address or receipt is claimed here."
+}
