@@ -39,12 +39,13 @@ contract DeploySepolia is Script {
 
         SequencerToken token = new SequencerToken();
 
-        // hat/glitch/snare as in contracts/launch.json (QuoteCalibration, native ETH); the whale scales with FDV.
-        bytes memory args = abi.encode(MANAGER, address(token), deployer, QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
+        // hat/glitch/snare as in launch.reference.json (QuoteCalibration, native ETH); the whale scales with FDV.
+        // The quote (native ETH) is not a constructor argument: the hook binds it from the pool key at initialize.
+        bytes memory args = abi.encode(MANAGER, address(token), deployer, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
         (address predicted, bytes32 salt) =
             HookMiner.find(CREATE2_FACTORY, FLAGS, type(SequencerHook).creationCode, args);
         SequencerHook hook =
-            new SequencerHook{salt: salt}(MANAGER, address(token), deployer, QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
+            new SequencerHook{salt: salt}(MANAGER, address(token), deployer, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
         require(address(hook) == predicted, "hook address mismatch");
         require(uint160(address(hook)) & 0x3fff == FLAGS, "hook flags");
 

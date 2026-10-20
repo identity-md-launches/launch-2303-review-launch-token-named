@@ -135,7 +135,7 @@ abstract contract SequencerHookTestBase is Test {
     }
 
     function args() internal view returns (bytes memory) {
-        return abi.encode(manager, address(token), address(this), QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
+        return abi.encode(manager, address(token), address(this), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
     }
 
     function _deploy() internal returns (SequencerHook deployed) {
@@ -153,7 +153,7 @@ abstract contract SequencerHookTestBase is Test {
                     )
                 );
                 deployed = new SequencerHook{salt: salt}(
-                    manager, address(token), address(this), QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE
+                    manager, address(token), address(this), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE
                 );
                 assertEq(address(deployed), predicted);
                 return deployed;
@@ -459,38 +459,51 @@ abstract contract SequencerHookTestBase is Test {
         vm.prank(address(manager));
         vm.expectRevert(SequencerHook.InvalidPool.selector);
         fresh.beforeInitialize(address(this), invalid, 1);
-        invalid = PoolKey(k.currency0, k.currency1, k.fee, k.tickSpacing, k.hooks);
-        invalid.currency0 = Currency.wrap(address(1));
+        // A sorted pair without the token is not this hook's pool, whatever the quote.
+        invalid = PoolKey(Currency.wrap(address(1)), Currency.wrap(address(2)), k.fee, k.tickSpacing, k.hooks);
         vm.prank(address(manager));
         vm.expectRevert(SequencerHook.InvalidPool.selector);
         fresh.beforeInitialize(address(this), invalid, 1);
+        // Nothing is bound before the factory opens the pool.
+        assertFalse(fresh.initialized());
+        assertEq(fresh.quote(), address(0));
+        assertFalse(fresh.quoteIs0());
         manager.initialize(k, uint160(1 << 96));
         assertTrue(fresh.initialized());
+        // The quote and its side come from the key the factory opened, and the binding is final.
+        assertEq(fresh.quote(), QUOTE);
+        assertEq(fresh.quoteIs0(), quote0());
+        vm.prank(address(manager));
+        vm.expectRevert(SequencerHook.AlreadyInitialized.selector);
+        fresh.beforeInitialize(address(this), k, 1);
     }
 
     function test_ConstructorRejectsBadAddressesAndThresholds() public {
         vm.expectRevert(SequencerHook.InvalidConfiguration.selector);
-        new SequencerHook(manager, address(token), address(this), QUOTE, 0, Q.T_GLITCH, Q.T_SNARE);
+        new SequencerHook(manager, address(token), address(this), 0, Q.T_GLITCH, Q.T_SNARE);
         vm.expectRevert(SequencerHook.InvalidConfiguration.selector);
-        new SequencerHook(manager, address(token), address(this), QUOTE, Q.T_GLITCH, Q.T_GLITCH, Q.T_SNARE);
+        new SequencerHook(manager, address(token), address(this), Q.T_GLITCH, Q.T_GLITCH, Q.T_SNARE);
         vm.expectRevert(SequencerHook.InvalidConfiguration.selector);
-        new SequencerHook(manager, QUOTE, address(this), QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
-        // The token must be a real ERC20 even when the quote is native ETH.
+        new SequencerHook(manager, address(token), address(this), Q.T_HAT, Q.T_SNARE, Q.T_SNARE);
+        // The token must be a real ERC20 (the manifest's $token); native ETH is never the launch token.
         vm.expectRevert(SequencerHook.InvalidConfiguration.selector);
-        new SequencerHook(manager, address(0), address(this), address(0), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
+        new SequencerHook(manager, address(0), address(this), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
         vm.expectRevert(SequencerHook.InvalidConfiguration.selector);
-        new SequencerHook(manager, address(0), address(this), ERC20_QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
+        new SequencerHook(IPoolManager(address(0)), address(token), address(this), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
         vm.expectRevert(SequencerHook.InvalidConfiguration.selector);
-        new SequencerHook(
-            IPoolManager(address(0)), address(token), address(this), QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE
-        );
-        vm.expectRevert(SequencerHook.InvalidConfiguration.selector);
-        new SequencerHook(manager, address(token), address(0), QUOTE, Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
+        new SequencerHook(manager, address(token), address(0), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE);
     }
 
-    function test_RejectsPoolWithTheOtherQuoteKind() public {
+    /// @dev The quote is whatever the factory pairs the token with: native ETH or an ERC20, on either side.
+    ///      It is bound by the first (only) initialization, so a hook is never tied to a quote it was not opened with.
+    function test_BindsTheQuoteTheFactoryOpensAndRejectsASecondPool() public {
         SequencerHook fresh = _deploy();
-        // Native hook: an ERC20-quoted pool is not its pair. ERC20 hook: the native ETH pool is not its pair.
+        // Unsorted currencies with the right pair are rejected.
+        PoolKey memory swapped = PoolKey(key.currency1, key.currency0, 12500, 60, IHooks(address(fresh)));
+        vm.prank(address(manager));
+        vm.expectRevert(SequencerHook.InvalidPool.selector);
+        fresh.beforeInitialize(address(this), swapped, 1);
+        // Only the factory may open the pool, whatever the quote.
         address other = nativeQuote() ? ERC20_QUOTE : address(0);
         bool otherFirst = other < address(token);
         PoolKey memory k = PoolKey(
@@ -500,14 +513,21 @@ abstract contract SequencerHookTestBase is Test {
             60,
             IHooks(address(fresh))
         );
+        vm.prank(address(0xBAD));
+        vm.expectRevert(); // InvalidPool, wrapped by the PoolManager (ERC-7751)
+        manager.initialize(k, uint160(1 << 96));
+        assertFalse(fresh.initialized());
+        // The factory opens the token against the other quote kind: that pool, and only it, is the hook's.
+        manager.initialize(k, uint160(1 << 96));
+        assertTrue(fresh.initialized());
+        assertEq(fresh.quote(), other);
+        assertEq(fresh.quoteIs0(), otherFirst);
+        assertEq(PoolId.unwrap(fresh.poolId()), PoolId.unwrap(k.toId()));
+        // The suite's own pair, with the same hook, is now a second pool: refused.
+        PoolKey memory second = PoolKey(key.currency0, key.currency1, 12500, 60, IHooks(address(fresh)));
         vm.prank(address(manager));
-        vm.expectRevert(SequencerHook.InvalidPool.selector);
-        fresh.beforeInitialize(address(this), k, 1);
-        // Unsorted currencies with the right pair are rejected too.
-        PoolKey memory swapped = PoolKey(key.currency1, key.currency0, 12500, 60, IHooks(address(fresh)));
-        vm.prank(address(manager));
-        vm.expectRevert(SequencerHook.InvalidPool.selector);
-        fresh.beforeInitialize(address(this), swapped, 1);
+        vm.expectRevert(SequencerHook.AlreadyInitialized.selector);
+        fresh.beforeInitialize(address(this), second, 1);
     }
 
     function test_DisabledCallbacksRefuse() public {

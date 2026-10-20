@@ -89,6 +89,8 @@ contract PulseTreasury is IUnlockCallback {
     error Reentrant();
     error NotPulsing();
     error NothingToBurn();
+    /// @dev The swap bought nothing (no liquidity reachable before the price limit): nothing is written.
+    error NoFill();
 
     /// @dev Deploy after launch: the hook must already be initialized on this exact pool.
     constructor(IPoolManager manager_, PoolKey memory key_, address hook_, address idm_) {
@@ -159,6 +161,9 @@ contract PulseTreasury is IUnlockCallback {
         BalanceDelta d = poolManager.swap(poolKey(), SwapParams(true, -int256(amount), limit), "");
         uint256 paid = uint256(-int256(d.amount0()));
         uint256 got = uint256(int256(d.amount1()));
+        // A (0, 0) fill would still run the hook's afterSwap and be filed as a 0-wei sell (heat -1, pressure
+        // -1000, lastTs reset), the opposite of a pulse: revert so the state and the idle window are untouched.
+        if (got == 0) revert NoFill();
         poolManager.settle{value: paid}();
         poolManager.take(Currency.wrap(idm), address(this), got);
         return abi.encode(paid, got);

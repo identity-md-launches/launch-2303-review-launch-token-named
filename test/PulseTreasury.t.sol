@@ -81,7 +81,7 @@ contract PulseTreasuryTest is Test {
     function _deployHook() internal returns (SequencerHook) {
         bytes memory init = abi.encodePacked(
             type(SequencerHook).creationCode,
-            abi.encode(manager, address(token), address(this), address(0), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE)
+            abi.encode(manager, address(token), address(this), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE)
         );
         bytes32 hash = keccak256(init);
         for (uint256 i; i < 300_000; ++i) {
@@ -89,7 +89,7 @@ contract PulseTreasuryTest is Test {
                 address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), bytes32(i), hash)))));
             if ((uint160(predicted) & Hooks.ALL_HOOK_MASK) == 0x3040 && predicted.code.length == 0) {
                 return new SequencerHook{salt: bytes32(i)}(
-                    manager, address(token), address(this), address(0), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE
+                    manager, address(token), address(this), Q.T_HAT, Q.T_GLITCH, Q.T_SNARE
                 );
             }
         }
@@ -236,6 +236,32 @@ contract PulseTreasuryTest is Test {
         _idle();
         treasury.pulse();
         assertEq(hook.state().heat, 6);
+    }
+
+    /// @dev Audit finding dff8117: with no liquidity reachable before the price limit the swap fills (0, 0).
+    ///      The pulse must then revert instead of filing a 0-wei sell (heat -1, pressure -1000, lastTs reset).
+    function test_PulseWithNoFillRevertsAndLeavesStateUntouched() public {
+        _saturate(5);
+        router.liquidity(key, -LIQ); // the LP withdraws everything
+        _idle();
+        (uint256 a, uint256 b) = hook.raw();
+        uint256 ethBefore = address(treasury).balance;
+        (bool ready,,,) = treasury.nextPulse();
+        assertTrue(ready); // the window is open; only the pool is empty
+        vm.expectRevert(PulseTreasury.NoFill.selector);
+        treasury.pulse();
+        (uint256 a2, uint256 b2) = hook.raw();
+        assertEq(a2, a, "slot0 untouched");
+        assertEq(b2, b, "slot1 untouched");
+        assertEq(hook.state().heat, 5);
+        assertEq(hook.state().pressure, 0);
+        assertEq(hook.state().swapCount, 10);
+        assertEq(address(treasury).balance, ethBefore);
+        // The idle window is not burnt: as soon as liquidity is back the same pulse goes through.
+        router.liquidity(key, LIQ);
+        treasury.pulse();
+        assertEq(hook.state().heat, 6);
+        assertEq(hook.state().swapCount, 11);
     }
 
     function test_SixteenPulsesInSilenceCompleteTrack() public {

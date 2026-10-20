@@ -16,6 +16,8 @@ import {SequencerState} from "./SequencerState.sol";
 /// @notice One factory-created IDM/quote pool (launch: IDM/ETH, native ETH); swaps compose music without moving funds.
 /// @dev Implements IHooks directly like IMD launch examples; disabled callbacks always refuse.
 ///      The quote may be native ETH (address(0), always currency0) or an ERC20; the hook never holds either.
+///      It is not a constructor argument: the IMD manifest cannot write a paired currency (and refuses a
+///      hand-written zero address), so the hook binds it from the PoolKey the launch factory opens, once.
 contract SequencerHook is IHooks {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -25,17 +27,19 @@ contract SequencerHook is IHooks {
     uint256 private slot1;
     PoolId public poolId;
     bool public initialized;
+    /// @notice Paired currency whose |delta| drives the rules; address(0) = native ETH.
+    ///         Bound once, in afterInitialize, from the pool the factory opens; never changes afterwards.
+    address public quote;
+    /// @notice True when the quote is currency0 (always for native ETH): orients the FDV read of the tick.
+    ///         Bound with `quote`; before initialization it reads false (the token taken as currency0).
+    bool public quoteIs0;
 
     IPoolManager public immutable poolManager;
     address public immutable token;
     address public immutable factory;
-    /// @notice Paired currency whose |delta| drives the rules; address(0) = native ETH.
-    address public immutable quote;
     uint128 public immutable T_HAT;
     uint128 public immutable T_GLITCH;
     uint128 public immutable T_SNARE;
-    /// @notice True when the quote is currency0 (always for native ETH): orients the FDV read of the tick.
-    bool public immutable quoteIs0;
     uint160 public constant HOOK_FLAGS = 0x3040;
     uint24 public constant LP_FEE = 12500;
     int24 public constant TICK_SPACING = 60;
@@ -78,29 +82,26 @@ contract SequencerHook is IHooks {
     event TrackReleased(uint32 indexed releaseId, uint32 patternId, uint256 slot0, uint256 slot1);
 
     /// @dev No constructor chain-state reads: IMD rehearses construction in an empty EVM.
+    ///      Manifest: ($poolManager, $token, $factory, hat, glitch, snare); the quote comes from the pool key.
     constructor(
         IPoolManager manager_,
         address token_,
         address factory_,
-        address quote_,
         uint128 hat_,
         uint128 glitch_,
         uint128 snare_
     ) {
-        // quote_ == address(0) is native ETH and is allowed; the token itself must be a real ERC20.
+        // The token itself must be a real ERC20; the quote (native ETH or an ERC20) is bound at initialization.
         if (
-            address(manager_) == address(0) || token_ == address(0) || factory_ == address(0) || token_ == quote_
-                || hat_ == 0 || hat_ >= glitch_ || glitch_ >= snare_
+            address(manager_) == address(0) || token_ == address(0) || factory_ == address(0) || hat_ == 0
+                || hat_ >= glitch_ || glitch_ >= snare_
         ) revert InvalidConfiguration();
         poolManager = manager_;
         token = token_;
         factory = factory_;
-        quote = quote_;
         T_HAT = hat_;
         T_GLITCH = glitch_;
         T_SNARE = snare_;
-        // Sorted pair: the quote is currency0 iff its address is lower (native ETH = address(0) always is).
-        quoteIs0 = quote_ < token_;
         Hooks.validateHookPermissions(this, getHookPermissions());
     }
 
@@ -115,15 +116,24 @@ contract SequencerHook is IHooks {
         p.afterSwap = true;
     }
 
-    function _validateInitialization(address sender, PoolKey calldata key) private view {
+    /// @dev Only the launch factory, only once, only the sorted token pair at the launch fee and spacing.
+    ///      Returns the paired currency and its side: the currency of the key that is not the token.
+    function _validateInitialization(address sender, PoolKey calldata key)
+        private
+        view
+        returns (address pairedCurrency, bool pairedIs0)
+    {
         if (initialized) revert AlreadyInitialized();
         // Sorted pair: native ETH (address(0)) is always currency0, an ERC20 quote may be either side.
         address a = Currency.unwrap(key.currency0);
         address b = Currency.unwrap(key.currency1);
         if (
             sender != factory || a >= b || address(key.hooks) != address(this) || key.fee != LP_FEE
-                || key.tickSpacing != TICK_SPACING || !((a == token && b == quote) || (a == quote && b == token))
+                || key.tickSpacing != TICK_SPACING || !(a == token || b == token)
         ) revert InvalidPool();
+        // a < b and one of them is the token, so the other is a distinct currency: the quote.
+        pairedIs0 = b == token;
+        pairedCurrency = pairedIs0 ? a : b;
     }
 
     function beforeInitialize(address sender, PoolKey calldata key, uint160)
@@ -141,7 +151,7 @@ contract SequencerHook is IHooks {
         onlyPoolManager
         returns (bytes4)
     {
-        _validateInitialization(sender, key);
+        (quote, quoteIs0) = _validateInitialization(sender, key);
         poolId = key.toId();
         initialized = true;
         (slot0, slot1) = SequencerState.encode(SequencerState.initialV2());
